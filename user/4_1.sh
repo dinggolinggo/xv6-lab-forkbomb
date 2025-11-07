@@ -1,13 +1,9 @@
 echo hello
+sleep 40 &
+sleep 30 &
 jobs
-sleep 10 &
-sleep 2 &
-jobs
-sleep 5
-jobs
-sleep 10
-jobs
+sleep 50
 echo Im awake
-sleep 6 &
+sleep 60 &
 jobs
 echo done
