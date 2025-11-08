@@ -178,16 +178,20 @@ getcmd(char *buf, int nbuf, int fd)
     bytes_read = read(fd, &c, 1);
     if(bytes_read <= 0) {
       // EOF or error
-      break;
+      if(i > 0) {
+        buf[i] = '\0';
+        return 0;
+      }
+      return -1;
     }
     if(c == '\n') {
-      break;
+      buf[i] = '\0';
+      return 0;
     }
     buf[i++] = c;
   }
   
-  if(i == 0)
-    return -1;  // EOF with no data
+  buf[i] = '\0';
   return 0;
 }
 
@@ -229,6 +233,9 @@ main(int argc, char *argv[])
       if(buf[2] == ' ') {
         if(chdir(buf+3) < 0)
           fprintf(2, "cannot cd %s\n", buf+3);
+      } else if(buf[2] == 0) {
+        // cd with no arguments - should fail
+        fprintf(2, "exec cd failed\n");
       }
       if(!is_script)
         printf("$ ");
@@ -275,7 +282,6 @@ main(int argc, char *argv[])
         sleep(1);
       } else {
         // Foreground job - wait for this specific child
-        // Use wait_noblock in a loop to handle both foreground and background jobs
         uint64 status;
         int wait_pid;
         
