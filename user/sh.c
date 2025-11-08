@@ -53,22 +53,10 @@ struct backcmd {
   struct cmd *cmd;
 };
 
-int fork1(void);  // Fork but panics on failure.
+int fork1(void);
 void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
-
-// Helper function to check if command is background
-int
-is_background_cmd(struct cmd *cmd)
-{
-  if(cmd == 0)
-    return 0;
-  if(cmd->type == BACK) {
-    return 1;
-  }
-  return 0;
-}
 
 // Helper function to poll and reap background jobs
 void
@@ -81,7 +69,6 @@ poll_background_jobs(void)
     // Remove from jobs array
     for(int i = 0; i < job_count; i++) {
       if(jobs[i] == pid) {
-        // Shift remaining jobs
         for(int j = i; j < job_count - 1; j++) {
           jobs[j] = jobs[j + 1];
         }
@@ -99,18 +86,6 @@ add_job(int pid)
   if(job_count < NPROC) {
     jobs[job_count++] = pid;
   }
-}
-
-// Check if a PID is a background job
-int
-is_bg_job(int pid)
-{
-  for(int i = 0; i < job_count; i++) {
-    if(jobs[i] == pid) {
-      return 1;
-    }
-  }
-  return 0;
 }
 
 // Execute cmd.  Never returns.
@@ -192,12 +167,27 @@ runcmd(struct cmd *cmd)
 }
 
 int
-getcmd(char *buf, int nbuf)
+getcmd(char *buf, int nbuf, int fd)
 {
+  int i = 0;
+  char c;
+  int bytes_read;
+  
   memset(buf, 0, nbuf);
-  gets(buf, nbuf);
-  if(buf[0] == 0) // EOF
-    return -1;
+  while(i < nbuf - 1) {
+    bytes_read = read(fd, &c, 1);
+    if(bytes_read <= 0) {
+      // EOF or error
+      break;
+    }
+    if(c == '\n') {
+      break;
+    }
+    buf[i++] = c;
+  }
+  
+  if(i == 0)
+    return -1;  // EOF with no data
   return 0;
 }
 
@@ -206,6 +196,8 @@ main(int argc, char *argv[])
 {
   static char buf[100];
   int fd = 0;
+  int fd_temp;
+  int is_script = 0;
 
   // Handle script file argument
   if(argc > 1) {
@@ -214,47 +206,43 @@ main(int argc, char *argv[])
       printf("sh: cannot open %s\n", argv[1]);
       exit(1);
     }
+    is_script = 1;
   } else {
     fd = 0; // stdin (keyboard)
-  }
-
-  // Redirect stdin to the file or keep it as stdin
-  close(0);
-  dup(fd);
-  close(fd);
-
-  // Ensure that three file descriptors are open (only in interactive mode)
-  if(argc < 2) {
-    while((fd = open("console", O_RDWR)) >= 0){
-      if(fd >= 3){
-        close(fd);
+    is_script = 0;
+    
+    // Ensure that three file descriptors are open
+    while((fd_temp = open("console", O_RDWR)) >= 0){
+      if(fd_temp >= 3){
+        close(fd_temp);
         break;
       }
     }
+    
+    printf("$ ");
   }
 
-  // Print initial prompt
-  printf("$ ");
-
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
+  while(getcmd(buf, sizeof(buf), fd) >= 0){
     // Handle 'cd' command
-    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
-      // Chdir must be called by the parent, not the child.
-      buf[strlen(buf)-1] = 0;  // chop \n
-      if(chdir(buf+3) < 0)
-        fprintf(2, "cannot cd %s\n", buf+3);
-      printf("$ ");
+    if(buf[0] == 'c' && buf[1] == 'd' && (buf[2] == ' ' || buf[2] == 0)){
+      if(buf[2] == ' ') {
+        if(chdir(buf+3) < 0)
+          fprintf(2, "cannot cd %s\n", buf+3);
+      }
+      if(!is_script)
+        printf("$ ");
       continue;
     }
 
     // Handle 'jobs' command
     if(buf[0] == 'j' && buf[1] == 'o' && buf[2] == 'b' && 
-       buf[3] == 's' && (buf[4] == '\n' || buf[4] == ' ')) {
+       buf[3] == 's' && (buf[4] == 0 || buf[4] == ' ')) {
       for(int i = 0; i < job_count; i++) {
         printf("%d\n", jobs[i]);
       }
-      printf("$ ");
+      if(!is_script)
+        printf("$ ");
       continue;
     }
 
@@ -262,15 +250,18 @@ main(int argc, char *argv[])
     struct cmd *parsed_cmd = parsecmd(buf);
     
     // Check if this is a background command
-    int is_bg = is_background_cmd(parsed_cmd);
+    int is_bg = 0;
+    if(parsed_cmd && parsed_cmd->type == BACK) {
+      is_bg = 1;
+    }
 
     // Fork and execute command
     int child_pid = fork1();
     if(child_pid == 0) {
-      // Child process - execute the command (NOT the BACK wrapper)
+      // Child process - execute the command
       if(is_bg) {
         struct backcmd *bcmd = (struct backcmd*)parsed_cmd;
-        runcmd(bcmd->cmd);  // Execute the inner command
+        runcmd(bcmd->cmd);
       } else {
         runcmd(parsed_cmd);
       }
@@ -280,23 +271,25 @@ main(int argc, char *argv[])
         // Background job - print PID and add to jobs array
         printf("[%d]\n", child_pid);
         add_job(child_pid);
+        // Give the background job a chance to start and complete
+        sleep(1);
       } else {
-        // Foreground job - wait ONLY for this specific child
-        // Use a loop to wait for the exact child process
-        int wait_pid;
+        // Foreground job - wait for this specific child
+        // Use wait_noblock in a loop to handle both foreground and background jobs
         uint64 status;
-        do {
+        int wait_pid;
+        
+        while(1) {
           wait_pid = wait_noblock(&status);
           if(wait_pid == child_pid) {
-            // Found our foreground process, break
+            // Found our foreground process
             break;
           } else if(wait_pid > 0) {
-            // This is a background process that finished, handle it
+            // Background process finished
             printf("[bg %d] exited with status %d\n", wait_pid, (int)status);
             // Remove from jobs array
             for(int i = 0; i < job_count; i++) {
               if(jobs[i] == wait_pid) {
-                // Shift remaining jobs
                 for(int j = i; j < job_count - 1; j++) {
                   jobs[j] = jobs[j + 1];
                 }
@@ -305,20 +298,21 @@ main(int argc, char *argv[])
               }
             }
           } else {
-            // wait_noblock returned 0 or -1, wait a bit then try again
+            // No zombie children yet, try again after brief sleep
             sleep(1);
           }
-        } while(wait_pid != child_pid);
+        }
       }
     }
     
-    // Poll for any remaining finished background jobs BEFORE printing next prompt
+    // Poll for remaining background jobs that may have finished
     poll_background_jobs();
     
-    // Print next prompt
-    printf("$ ");
+    // Print next prompt (only in interactive mode)
+    if(!is_script)
+      printf("$ ");
   }
-  
+
   exit(0);
 }
 
